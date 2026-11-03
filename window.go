@@ -172,9 +172,15 @@ type WindowOptions struct {
 	// as its parent moves. On macOS it is ordered above its parent
 	// whenever the parent comes in front, stays above a parent that is
 	// AlwaysOnTop, goes with it into full screen, and hides while the
-	// parent is minimized or hidden.
+	// parent is minimized or hidden. The Parent may be a flyout, a tray's
+	// included: without X and Y, the window is centered over it, in the
+	// work area of its display, and stays above it.
 	Parent *Window
-	// Modal makes a child window modal to its Parent.
+	// Modal makes a child window modal to its Parent, which takes no
+	// input until it closes: a sheet of the parent on macOS, unless the
+	// parent is a flyout. A flyout stays open while a window is modal to
+	// it, wherever the keyboard goes, and closing the flyout closes the
+	// window: a confirmation a tray's flyout asks for, wider than it.
 	Modal bool
 
 	// Panel makes the window a panel, as the windows of launchers and
@@ -549,14 +555,12 @@ func newWindow(opts WindowOptions, bg *background, native uintptr, flyout *flyou
 
 	w := &Window{id: id, parent: opts.Parent, trustedOrigins: opts.Page.TrustedOrigins, untrusted: opts.Page.Untrusted, secret: randomText(), stateKey: opts.StateKey, background: bg, content: opts.Content, panel: opts.Panel && flyout == nil, active: true}
 	w.pg = &Page{w}
-	if opts.Content == nil {
-		if flyout != nil {
-			w.fit = flyout.fit
-		} else if opts.FitContent {
-			w.fit = &fitContent{
-				min: platform.Size{Width: opts.MinWidth, Height: opts.MinHeight},
-				max: platform.Size{Width: opts.MaxWidth, Height: opts.MaxHeight},
-			}
+	if flyout != nil {
+		w.fit = flyout.fit
+	} else if opts.Content == nil && opts.FitContent {
+		w.fit = &fitContent{
+			min: platform.Size{Width: opts.MinWidth, Height: opts.MinHeight},
+			max: platform.Size{Width: opts.MaxWidth, Height: opts.MaxHeight},
 		}
 	}
 	w.hiddenTitleBar = !opts.Frameless && (opts.TitleBarStyle == TitleBarHidden || opts.TitleBarStyle == TitleBarHiddenInset)
@@ -709,6 +713,10 @@ func (w *Window) platformOptions(o *WindowOptions) *platform.WindowOptions {
 	}
 	if o.Parent != nil && o.Parent.native != nil {
 		p.Parent = o.Parent.native
+		if o.Parent.flyout != nil && p.Center {
+			p.Center = false
+			p.X, p.Y = overFlyout(o.Parent.native.Bounds(), platform.Size{Width: p.Width, Height: p.Height})
+		}
 	}
 	w.preload, w.preloadAllFrames = po.PreloadScript, po.PreloadAllFrames
 	if w.fit != nil {
@@ -719,6 +727,19 @@ func (w *Window) platformOptions(o *WindowOptions) *platform.WindowOptions {
 	// pagesLocaleChanged).
 	w.userScripts = p.UserScripts
 	return p
+}
+
+// overFlyout returns where a window of size goes over a flyout at
+// bounds: centered on it, and moved into the work area of its display,
+// which a dialog wider than a flyout at the edge of the screen, as a
+// tray's, would cross.
+func overFlyout(bounds platform.Rect, size platform.Size) (x, y int) {
+	r := platform.Rect{X: bounds.X + (bounds.Width-size.Width)/2, Y: bounds.Y + (bounds.Height-size.Height)/2, Width: size.Width, Height: size.Height}
+	if wa := platform.WorkAreaFor(bounds, backend().Screen().Displays()); wa.Width > 0 && wa.Height > 0 {
+		r.X = max(min(r.X, wa.X+wa.Width-r.Width), wa.X)
+		r.Y = max(min(r.Y, wa.Y+wa.Height-r.Height), wa.Y)
+	}
+	return r.X, r.Y
 }
 
 func jsPlatform() string {
@@ -876,6 +897,9 @@ func (w *Window) show() {
 		return
 	}
 	visible := w.native.IsVisible()
+	if w.fitShow(visible); w.native == nil {
+		return // the frame it laid out closed it
+	}
 	w.native.Show()
 	w.shown = true
 	if !visible {
@@ -891,6 +915,9 @@ func (w *Window) ShowInactive() {
 			return
 		}
 		visible := w.native.IsVisible()
+		if w.fitShow(visible); w.native == nil {
+			return // the frame it laid out closed it
+		}
 		w.native.ShowInactive()
 		w.shown = true
 		if !w.focusKnown {
@@ -901,6 +928,15 @@ func (w *Window) ShowInactive() {
 			fire(&w.onShow)
 		}
 	})
+}
+
+// fitShow sizes a hidden flyout of native UI that takes its content's
+// size to that content before it shows (fitContent.show). Main thread
+// only.
+func (w *Window) fitShow(visible bool) {
+	if f := w.fit; f != nil && f.show != nil && !visible {
+		f.show(w)
+	}
 }
 
 // Hide hides the window. Called right after NewWindow, it keeps a window
@@ -1081,7 +1117,14 @@ func (w *Window) Size() (width, height int) {
 	return b.Width, b.Height
 }
 
-// SetContentSize resizes the window so the page area has the given size.
+// SetContentSize resizes the window so the page area has the given size,
+// in the window's DIPs. A zoom does not change them: a page zoomed by z
+// (Page.SetZoomFactor), or native UI (ui's Context.SetZoom), lays out in
+// width/z × height/z of its own. Multiply a size the view needs by the
+// zoom:
+//
+//	z := c.Zoom() // in native UI; Page.ZoomFactor for a page
+//	win.SetContentSize(int(math.Ceil(float64(320*z))), int(math.Ceil(float64(400*z))))
 func (w *Window) SetContentSize(width, height int) {
 	w.do(func(n platform.Window) {
 		if w.setFlyoutSize(width, height) {
@@ -1093,7 +1136,8 @@ func (w *Window) SetContentSize(width, height int) {
 	})
 }
 
-// ContentSize returns the size of the page area.
+// ContentSize returns the size of the page area, in the window's DIPs:
+// a view zoomed by z sees it divided by z, as ui's Context.Size returns it.
 func (w *Window) ContentSize() (width, height int) {
 	b := w.ContentBounds()
 	return b.Width, b.Height

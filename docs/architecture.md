@@ -908,7 +908,32 @@ document start into the main frame. It installs:
   within its display's work area; a size equal to the last it took does
   nothing, so a user's resize holds. The same in every engine: WebKit's
   private `-[WKWebView _setSizeToContentAutoSizeMaximumSize:]` is not
-  used.
+  used. A flyout of native UI fits without the bridge: its
+  `surface.Conn` gets `FitWidth` (the width's limits and the work area's
+  width, from the display the flyout is on) and `ContentSize`, through
+  `fitContent.native`, which `NewFlyout` sets so that apps without such a
+  flyout link none of the core's side, and
+  `ui/fit.go` measures the root as each frame lays out, right after
+  `layoutTree`: `contentWidth(root, true)` within those widths, and
+  `contentHeight` at that width, the non-committing layout flex columns
+  measure their items with, so percentages and `Grow` measure as their
+  content, as `height: auto`; absolutely placed elements and the
+  inspector take none of it. It tells a size only when it differs from
+  the last it told, and the core clamps it as a page's (`fitNative`),
+  then resizes and places the flyout after the frame (`postMain`, as the
+  backends' resizes may send the surface events at once): the surface's
+  `SurfaceResize` brings the frame laid out at the new size. A frame laid
+  out at a new size that measures the size told before the last one
+  holds, so that a view building its content after `Context.Size` does
+  not resize the flyout back and forth. A hidden window draws no frames,
+  so `Show` and `ShowInactive` of a hidden flyout first call
+  `fitContent.show` (`fitBeforeShow`), which `NewFlyout` sets with
+  `native`: where the content waits to draw a frame, `surface.Conn.Fit`
+  builds and lays it out at once, as a capture does, and the flyout
+  takes the size it measured before the platform shows it; the
+  surface's next frame draws it at that size. `Fit` builds nothing
+  within the content's frame or before its first, so the view never
+  runs within `NewFlyout`.
 - Find in page (`find.ts`, `Page.FindInPage`): the bridge walks the
   visible text nodes, marks matches with the CSS Custom Highlight API (a
   constructed style sheet, which a Content Security Policy allows) and
@@ -1850,7 +1875,19 @@ as in Tauri:
   A global monitor of mouse downs
   closes macOS's focusable panels on clicks outside the app, which a
   panel taking the keyboard of an app that was not activated never
-  hears as the key window changing. The design follows GPUI's
+  hears as the key window changing. A window modal to a flyout
+  (`WindowOptions.Parent`, `Modal`) is centered over it by the core
+  (`overFlyout`), in its display's work area, and keeps it open: the
+  flyout's dismissals skip a flyout a window is modal to (`modalChild`
+  on macOS and Linux, `hasModal` on Windows, where `EnableWindow`
+  disables the owner as for any modal window). macOS attaches the window
+  as an AppKit child window at the flyout's level rather than a sheet,
+  and a local monitor eats the flyout's mouse and key events while it
+  shows (`watchModalInput`); `popoverShouldClose:` keeps a popover.
+  Windows makes it topmost over a topmost flyout. On X11 the popup lets
+  its grab go while the window shows and grabs again as it hides
+  (`enterFlyout`, `leaveFlyout`); a tray's flyout, a toplevel, does not
+  close as it loses the keyboard to it. The design follows GPUI's
   `WindowKind::AnchoredPopup` and winit's `WindowType::Popup`, which
   model xdg_positioner too.
 - Panels (`WindowOptions.Panel`), the windows of launchers: the core makes
@@ -3843,10 +3880,19 @@ either.
   4095 pixels a side, draws as tiles of it (`pathTiles`), each a mask of
   the whole path clipped to the tile: only the tiles that show and that
   its edges reach, and, inside a fill, tiles covered whole, which share
-  one mask. A stroke's mask is the outline of its center line, each edge
-  drawn once (`strokeInto`): one side, turning at corners and ends as the
-  path's joins and caps say (`Path.Join`, `Path.Cap`), and back along the
-  other. Its dashes (`Path.Dash`) are cut from the center line as the mask
+  one mask. So does a path larger than a tile (511 pixels a side) when
+  the atlas has lately had no room for a path's mask
+  (`pathCrowdedPaints`): such a mask takes a shelf of the atlas of its
+  own, mostly empty for a long thin stroke, and a few of them, as wires
+  redrawn every frame, leave no room for the frame's other paths, which
+  would not show. A path whose mask finds no room draws as tiles at once,
+  and the runtime's repaint (`System.MakeRoom`) draws the frame's large
+  paths as tiles, which pack eight to a row of the largest atlas. On the
+  pixel grid tiles show the pixels of one mask; under a transform off
+  it, a faint line where they meet. A stroke's mask is the outline of
+  its center line, each edge drawn once (`strokeInto`): one side,
+  turning at corners and ends as the path's joins and caps say
+  (`Path.Join`, `Path.Cap`), and back along the other. Its dashes (`Path.Dash`) are cut from the center line as the mask
   is drawn, from where each polyline starts in their pattern, so that a
   trimmed path's dashes stay where they are, and its key holds that place,
   in quarters of a pixel within one pattern, with the caps, joins and
@@ -4273,7 +4319,20 @@ either.
     draws the batches scissored to each. GTK keeps the GtkGLArea's framebuffer from render to
     render, but makes its buffers anew, holding nothing defined, whenever
     it allocates the area, at the same size too: a `SurfaceResize` has the
-    next frame draw whole (`Invalidate`). A canvas's WebGL 2 context keeps
+    next frame draw whole (`Invalidate`). Once the area has a context, GTK
+    composites the whole window with OpenGL and tells EGL what each paint
+    changed (`eglSwapBuffersWithDamageEXT`) in the window's coordinates
+    unscaled, where EGL takes the buffer's pixels from the bottom left: at
+    a scale of 2, Mesa told a compositor that a change at the top of the
+    window was in its lower half, at half its size. A compositor that
+    redraws only what it is told changed (Mesa's llvmpipe tells it whole
+    frames changed, a GPU's buffers what GTK said) then showed title
+    buttons the pointer hovered flickering or gone, and a shadow missing on
+    some sides (#1071). At a scale of 2 or more on Wayland, the toplevel's
+    `draw` signal adds what GTK repaints (cairo's clip) as
+    `wl_surface.damage`, in the surface's coordinates, to the commit of the
+    swap that follows (`damageGLPaint`); `TestGLDamageWayland` checks it
+    under `weston --scale=2`. A canvas's WebGL 2 context keeps
     its drawing buffer (`preserveDrawingBuffer`), which browsers then copy
     as they composite each frame drawn; in Chrome on an M5 a caret blinking
     still took a quarter of the GPU's time it took drawn whole, and a frame
@@ -5120,7 +5179,7 @@ which npm allows only for packages that exist: the first release uses an
 | downloads | `shouldPerformDownload`, non-displayable or attachment responses → `WKDownload` delegate | `download-started` / `decide-destination` on the web context; response policy for attachments | `DownloadStarting` (`ICoreWebView2_4`), replacing WebView2's download UI |
 | Cookies | the session's `WKWebsiteDataStore`'s `WKHTTPCookieStore`, URLs matched in Go (`platform.CookieMatchesURL`), `Set` through `NSHTTPCookie`'s parser with a stand-in name and value; `Clear` with `removeDataOfTypes:` | the session's web context's `WebKitCookieManager` (2.42+; `get_cookies` for a URL), kept in `cookies.sqlite` of the user data directory, or of a persistent session's directory (`set_persistent_storage`, as WebKitGTK keeps them in memory otherwise); libsoup 3 or 2.4 to match WebKitGTK 4.1 or 4.0; `Clear` with `webkit_website_data_manager_clear` | `ICoreWebView2CookieManager` (`ICoreWebView2_2`) of a window's web view of the session's profile, or before one shows a page of a hidden web view of the profile in the app window, closed once one does, or once an ephemeral session's store closes; a window's first navigation waits for the calls under way; `ClearBrowsingData` goes the same way; changes are polled with `GetCookies` until they show, failing after 2 s; `GetCookies(uri)`, `DeleteAllCookies`; `put_Expires` called with `comCallFloat` |
 | content rules | the default `WKContentRuleListStore`, which keeps compiled lists under an identifier of the id and a hash of the rules (looked up first, the id's others removed), on each window's `WKUserContentController`; the store's reason for a failure is in `NSHelpAnchorErrorKey` | a `WebKitUserContentFilterStore` in `content-rules` of the user data directory (2.24+), on each window's `WebKitUserContentManager` | matched in Go (`internal/contentrules`, indexed by the domains of `url-filter`s and four bytes of their literals) from `WebResourceRequested` with a `*` filter, blocked pages answered with an empty 403 and other blocked requests with a redirect to `data:`, which Chromium fails as a network error; WebSocket handshakes never reach it; `css-display-none` rules as a style sheet a document-creation script adopts, kept when the page sets `adoptedStyleSheets`; parsed on a goroutine, nothing kept |
-| `FitContent` | the bridge, as elsewhere; WebKit's private `_setSizeToContentAutoSizeMaximumSize:` is not used | the bridge | the bridge |
+| `FitContent` | the bridge, as elsewhere; WebKit's private `_setSizeToContentAutoSizeMaximumSize:` is not used; native UI measures itself (`ui/fit.go`) | the bridge; native UI measures itself | the bridge; native UI measures itself |
 | `Page.ThemeColor` | the bridge, as elsewhere; WKWebView's `themeColor` (macOS 12+) is not used | the bridge | the bridge |
 | `Page.ProcessID` | the web content process, `-[WKWebView _webProcessIdentifier]` (private, looked up with `respondsToSelector:`) | 0: WebKitGTK has no API for it | the browser process the app's web views share, `ICoreWebView2::get_BrowserProcessId` |
 | a page's sound (`IsAudible`, `SetAudioMuted`) | private `-[WKWebView _isPlayingAudio]`, key-value observed, and `_mediaMutedState` / `_setPageMuted:` with the `_WKMediaAudioMuted` bit, the capture bits kept; looked up with `respondsToSelector:`, not audible and not muted where WebKit doesn't answer | `webkit_web_view_is_playing_audio` and `notify::is-playing-audio`; `webkit_web_view_set_is_muted` / `get_is_muted` (2.30+, bound when present) | `ICoreWebView2_8`'s `IsDocumentPlayingAudio`, `IsDocumentPlayingAudioChanged` and `IsMuted`, queried for each call; a mute set before the web view is made is put in `setUp`, before its first navigation |
@@ -5128,7 +5187,7 @@ which npm allows only for packages that exist: the first release uses an
 | a page's capture (`CaptureState`, `SetCaptureState`) | `WKWebView`'s `cameraCaptureState` and `microphoneCaptureState` (macOS 12+) and private `_displayCaptureState` (macOS 13+), key-value observed, and their setters `set…CaptureState:completionHandler:` (nil handler), looked up with `respondsToSelector:`; `SetAudioMuted`'s `_setPageMuted:` has one bit for the camera and the microphone, so with only one of them muted the other is unmuted again after it | `webkit_web_view_get_camera_capture_state` and its microphone and display siblings with their `notify::` signals and setters (2.34+, bound when present); `webkit_web_view_set_is_muted` drops the capture mutes, which `SetAudioMuted` sets again | none: `CaptureNone`, setting does nothing |
 | `Autoplay: AutoplayAllow` | `WKWebViewConfiguration`'s `mediaTypesRequiringUserActionForPlayback` `WKAudiovisualMediaTypeNone`; a `window.open()` window that doesn't ask gets the default of a new configuration back on the opener's copy | `webkit_policy_decision_use_with_policies` on every main-frame navigation, with `webkit_website_policies_new_with_policies` `autoplay` `WEBKIT_AUTOPLAY_ALLOW` (2.30+, bound when present; its variadic name/value pairs bound for one pair, as `g_object_set`): WebKitGTK decides autoplay from the navigation's policies, `WEBKIT_AUTOPLAY_ALLOW_WITHOUT_SOUND` by default, which `media-playback-requires-user-gesture` (off by default) does not lift | `--autoplay-policy=no-user-gesture-required` in the environment options' `AdditionalBrowserArguments` when the page that starts the environment asks (later ones are logged); then every page plays without a gesture |
 | picture in picture (`PageOptions.PictureInPicture`) | private `-[WKPreferences _setAllowsPictureInPictureMediaPlayback:]`; `-[WKWebView _canTogglePictureInPicture]`, `_togglePictureInPicture` and `_isPictureInPictureActive`, looked up with `respondsToSelector:`; a main-frame navigation leaving with a video out turns `_setUsesPageCache:` off until one leaves without, as WebKit restores such a page believing its video still out | none: `TogglePictureInPicture` does nothing, `IsPictureInPictureActive` is false | Chromium's, on whatever the option; `TogglePictureInPicture` runs `requestPictureInPicture()` (or `exitPictureInPicture()`) through the DevTools protocol's `Runtime.evaluate` with `userGesture`, `IsPictureInPictureActive` evaluates `document.pictureInPictureElement` |
-| a page's session state (`SessionState`) | `WKWebView`'s `interactionState` (macOS 12+, looked up with `respondsToSelector:`), NSData of WebKit's `_sessionStateData`; restored when the back/forward list then has a current item | `webkit_web_view_get_session_state` / `_session_state_serialize`, `_session_state_new` / `restore_session_state`, then `go_to_back_forward_list_item` of the current item (2.12+, bound on first use) | none: the core keeps the URL alone and loads it |
+| a page's session state (`SessionState`) | `WKWebView`'s `interactionState` (macOS 12+, looked up with `respondsToSelector:`), NSData of WebKit's `_sessionStateData`; restored when the back/forward list then has a current item; WebKit puts a page that scrolled before its window first showed on screen back at the top as the window does, so a page restored before then gets a script in the default client world, as it loads, that puts it back at the private `_scrollPosition` of the current item when it next scrolls to the top before any input | `webkit_web_view_get_session_state` / `_session_state_serialize`, `_session_state_new` / `restore_session_state`, then `go_to_back_forward_list_item` of the current item (2.12+, bound on first use) | none: the core keeps the URL alone and loads it |
 | ClearBrowsingData, `Session.ClearData` | the session's `WKWebsiteDataStore`, `allWebsiteDataTypes` or the `WKWebsiteDataType`s of the kinds the system's WebKit exports | the session's web context's website data manager, `WEBKIT_WEBSITE_DATA_ALL` or the kinds' types | the WebView2 profile's `ClearBrowsingDataAll`, or `ClearBrowsingData` of the kinds' `COREWEBVIEW2_BROWSING_DATA_KINDS` (`ICoreWebView2Profile2`, through the web view cookie calls use) |
 | sessions (`PageOptions.Session`) | a `WKWebsiteDataStore` set on each web view's configuration: `dataStoreForIdentifier:` of a UUID made of the name (macOS 14+; before, `nonPersistentDataStore` kept until the app quits), `nonPersistentDataStore` for an ephemeral one, released when its last page closes; `window.open` hands the opener's configuration over | a `WebKitWebContext` per session, made with `webkit_web_context_new_with_website_data_manager` of a manager with base data and cache directories in `Sessions/<UUID>` of the user data and cache directories, or `webkit_website_data_manager_new_ephemeral`; web views made with `g_object_new` and `web-context`, which keeps a reference to it; custom schemes, languages and downloads set up on each context; unreferenced when an ephemeral one's last page closes | a WebView2 profile per session (`ICoreWebView2Environment10`'s controller options: `put_ProfileName` `mygo-<UUID>`, or `mygo-private-<n>` with `put_IsInPrivateModeEnabled` for an ephemeral one, a new name for each of its stores); windows, web views in native UI and the cookie calls' hidden web views made with those options |
 | HTTP sign-in (`SetAuthHandler`) | `webView:didReceiveAuthenticationChallenge:completionHandler:`, `NSURLCredential` for the session; none: no prompt, the 401 page; empty answer: `RejectProtectionSpace` | `WebKitWebView::authenticate`, `webkit_credential_new` for the session; none: WebKitGTK's dialog; empty answer: authenticates without credentials | `ICoreWebView2_10`'s `BasicAuthenticationRequested`, scheme and realm parsed from its challenge, no proxy flag; none: WebView2's dialog; empty answer: `Cancel` |

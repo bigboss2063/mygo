@@ -156,6 +156,18 @@ term, err := terminal.New(terminal.Options{
   shell (`-zsh`), as terminal apps start it, so that it reads the user's
   profile: `$SHELL`, else `/bin/zsh` on macOS and `/bin/sh` elsewhere, and
   PowerShell on Windows.
+- `ShellIntegration: true` enables zsh prompt integration. A temporary
+  `.zshenv` restores the original `ZDOTDIR` before sourcing the user's startup
+  files and installs OSC 133 prompt markers after the user's prompt theme.
+  Powerlevel10k is asked to emit its own markers for asynchronous redraws.
+  When columns change, the marked prompt is cleared at its old width before
+  reflow, and zsh redraws it after `SIGWINCH`; right and multiline prompts
+  therefore do not accumulate in the scrollback. Command output and alternate
+  screens retain their normal resize behavior. The user's files are never
+  modified, temporary files are removed when the terminal exits or closes,
+  and other local shells are unchanged. With `Conn`, the source must provide
+  OSC 133 markers and redraw its prompt on resize; the plugin does not inject
+  shell startup configuration into remote sessions. Integration is off by default.
 - `Env` adds to the environment, which has `TERM=xterm-256color`,
   `COLORTERM=truecolor`, and `LANG=en_US.UTF-8` when no locale is set, as
   for apps started from the Finder.
@@ -441,7 +453,9 @@ term, err := terminal.New(terminal.Options{Font: terminal.Font{
 - `Features` turn OpenType features on and off: `"ss01"` or `"+ss01"` on,
   `"calt=0"` or `"-calt"` off, `"cv05=2"` an alternate. Coding fonts make
   most of their ligatures with `calt`, the others with `liga`; a ligature
-  spans the cells of its characters.
+  spans the cells of its characters. On macOS, kerning is off unless the
+  list names `kern`, so that each character keeps its place in its cells;
+  `"+kern"` keeps the font's.
 - `LineHeight` makes rows taller or shorter than the font's line height,
   with the text centered in them; box drawing still joins.
 - `Thicken` draws text with a thicker stroke, with Core Text's font
