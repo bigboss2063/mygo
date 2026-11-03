@@ -10,6 +10,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"slices"
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/accelerator"
@@ -59,6 +60,13 @@ func copyUTF16(dst []uint16, s string) {
 	src := utf16Units(s)
 	n := copy(dst[:len(dst)-1], src)
 	dst[n] = 0
+}
+
+// shellNotifyIcon adds, changes or removes an icon in the notification
+// area; a test replaces it to keep the shell out.
+var shellNotifyIcon = func(nim uintptr, d *notifyIconData) bool {
+	r, _, _ := procShellNotifyIconW.Call(nim, uintptr(unsafe.Pointer(d)))
+	return r != 0
 }
 
 type tray struct {
@@ -122,7 +130,7 @@ func (t *tray) data(flags uint32) notifyIconData {
 
 func (t *tray) add() {
 	d := t.data(0)
-	procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&d)))
+	shellNotifyIcon(nimAdd, &d)
 	t.added = true
 }
 
@@ -131,7 +139,7 @@ func (t *tray) update() {
 		return // NewTray adds it as it is
 	}
 	d := t.data(0)
-	procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&d)))
+	shellNotifyIcon(nimModify, &d)
 }
 
 func (t *tray) SetImage(data []byte, template bool) error {
@@ -204,7 +212,7 @@ func (t *tray) SetID(id string) {
 	}
 	if t.added {
 		d := t.data(0)
-		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&d)))
+		shellNotifyIcon(nimDelete, &d)
 	}
 	delete(t.b.trays, t.id)
 	t.id = n
@@ -283,9 +291,11 @@ func (t *tray) rect() (rect, bool) {
 }
 
 func (t *tray) Destroy() {
+	id := t.notification
+	t.notification = ""
 	if t.added {
 		d := t.data(0)
-		procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&d)))
+		shellNotifyIcon(nimDelete, &d)
 		t.added = false
 	}
 	if t.icon != 0 && !t.temporary {
@@ -294,6 +304,19 @@ func (t *tray) Destroy() {
 	}
 	t.destroyBalloonIcon()
 	delete(t.b.trays, t.id)
+	if id == "" {
+		return
+	}
+	// The balloon went with the icon: let go of the notification and show
+	// the next one where another icon can. Without one, as while quitting,
+	// the rest wait for the app's next tray icon.
+	if n := t.b.notifications[id]; n != nil {
+		n.tray = nil
+		delete(t.b.notifications, id)
+	}
+	if t.b.hasNotificationTray() {
+		t.b.showQueuedNotification()
+	}
 }
 
 func (t *tray) destroyBalloonIcon() {
@@ -348,42 +371,127 @@ func iconFromPNG(data []byte, size int) (uintptr, error) {
 }
 
 // Notifications are notification area balloons, which Windows 10 and later
-// show as toasts. They need an icon: the first tray icon, else a temporary
-// one with the application's icon.
+// show as toasts. One icon shows them in turn, the app's first tray icon or
+// a temporary one with the application's icon: an icon per notification
+// would leave icons of their own in the notification area.
 
-type notification struct{ tray *tray }
+type notification struct {
+	note *platform.Notification
+	tray *tray // showing, or nil while it waits in the queue
+}
 
 func (b *Backend) NotificationsSupported() bool { return true }
 
 func (b *Backend) ShowNotification(n *platform.Notification, done func(error)) {
+	// done at once, even when another notification holds the icon:
+	// ShowContext blocks the main thread until done, and only the main
+	// thread can show the next one.
 	done(b.showNotification(n))
 }
 
 func (b *Backend) showNotification(n *platform.Notification) error {
 	if old := b.notifications[n.ID]; old != nil {
-		// Shown again under its ID: the notification it replaces gives up
-		// its tray, and its balloon's icon, rather than leaving them.
-		b.finishNotification(old.tray)
+		// Shown again under its ID: its balloon shows the new content at
+		// once, or when its turn comes.
+		old.note = n
+		if old.tray != nil {
+			if err := b.showBalloon(old.tray, n); err != nil {
+				b.finishNotification(old.tray)
+				return err
+			}
+		}
+		return nil
 	}
-	var t *tray
-	for _, x := range b.trays {
-		if !x.temporary && x.notification == "" && x.added {
-			t = x
-			break
+	b.notifications[n.ID] = &notification{note: n}
+	b.notificationQueue = append(b.notificationQueue, n.ID)
+	b.showQueuedNotification()
+	if b.notifications[n.ID] == nil {
+		// The icon refused it: showQueuedNotification dropped it.
+		return fmt.Errorf("mygo: cannot show the notification")
+	}
+	return nil
+}
+
+// showQueuedNotification shows the first notification waiting, when the
+// icon that shows notifications shows none, and lets a temporary icon go
+// once nothing waits.
+func (b *Backend) showQueuedNotification() {
+	for len(b.notificationQueue) > 0 {
+		t := b.notificationTray()
+		if t.notification != "" {
+			return
+		}
+		id := b.notificationQueue[0]
+		b.notificationQueue = b.notificationQueue[1:]
+		n := b.notifications[id]
+		if n == nil {
+			continue
+		}
+		if err := b.showBalloon(t, n.note); err != nil {
+			delete(b.notifications, id)
+			continue
+		}
+		n.tray = t
+		t.notification = id
+		b.releaseTemporaryTrays()
+		return
+	}
+	b.releaseTemporaryTrays()
+}
+
+// releaseTemporaryTrays destroys the temporary notification icons that
+// show nothing: an app tray icon shows the notifications now.
+func (b *Backend) releaseTemporaryTrays() {
+	for _, t := range b.trays {
+		if t.temporary && t.notification == "" {
+			t.Destroy()
 		}
 	}
-	if t == nil {
-		b.nextTray++
-		t = &tray{b: b, id: b.nextTray, temporary: true}
-		t.icon, _, _ = procLoadIconW.Call(instance(), 1)
-		if t.icon == 0 {
-			t.icon, _, _ = procLoadIconW.Call(0, 32512) // IDI_APPLICATION
+}
+
+// hasNotificationTray reports whether an icon is there to show the
+// notifications waiting.
+func (b *Backend) hasNotificationTray() bool {
+	for _, t := range b.trays {
+		if t.added {
+			return true
 		}
-		b.trays[t.id] = t
-		t.add()
 	}
-	t.notification = n.ID
-	b.notifications[n.ID] = &notification{tray: t}
+	return false
+}
+
+// notificationTray returns the icon that shows notifications: the app's
+// first tray icon, else a temporary one with the application's icon, made
+// once and reused while notifications wait.
+func (b *Backend) notificationTray() *tray {
+	var first *tray
+	for _, t := range b.trays {
+		if !t.temporary && t.added && (first == nil || t.id < first.id) {
+			first = t
+		}
+	}
+	if first != nil {
+		return first
+	}
+	for _, t := range b.trays {
+		if t.temporary && t.added {
+			return t
+		}
+	}
+	b.nextTray++
+	t := &tray{b: b, id: b.nextTray, temporary: true}
+	t.icon, _, _ = procLoadIconW.Call(instance(), 1)
+	if t.icon == 0 {
+		t.icon, _, _ = procLoadIconW.Call(0, 32512) // IDI_APPLICATION
+	}
+	b.trays[t.id] = t
+	t.add()
+	return t
+}
+
+// showBalloon shows n on t, replacing the balloon t shows.
+func (b *Backend) showBalloon(t *tray, n *platform.Notification) error {
+	t.destroyBalloonIcon()
 	d := t.data(nifInfo)
 	title := n.Title
 	body := n.Body
@@ -402,35 +510,50 @@ func (b *Backend) showNotification(n *platform.Notification) error {
 			d.InfoFlags |= niifLargeIcon
 		}
 	}
-	if r, _, _ := procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&d))); r == 0 {
-		b.finishNotification(t)
+	if !shellNotifyIcon(nimModify, &d) {
+		t.destroyBalloonIcon()
 		return fmt.Errorf("mygo: cannot show the notification")
 	}
 	return nil
 }
 
 func (b *Backend) RemoveNotification(id string) {
-	if n := b.notifications[id]; n != nil {
-		b.finishNotification(n.tray)
+	n := b.notifications[id]
+	if n == nil {
+		return
 	}
+	if n.tray != nil {
+		b.finishNotification(n.tray)
+		return
+	}
+	delete(b.notifications, id)
+	b.notificationQueue = slices.DeleteFunc(b.notificationQueue, func(queued string) bool { return queued == id })
+	b.showQueuedNotification()
 }
 
 func (b *Backend) RemoveAllNotifications() {
+	b.notificationQueue = nil
 	for _, n := range b.notifications {
-		b.finishNotification(n.tray)
+		if n.tray != nil {
+			b.finishNotification(n.tray)
+		}
 	}
+	clear(b.notifications)
 }
 
 func (b *Backend) finishNotification(t *tray) {
-	delete(b.notifications, t.notification)
+	id := t.notification
 	t.notification = ""
-	if t.temporary {
-		t.Destroy()
-		return
+	if n := b.notifications[id]; n != nil && n.tray == t {
+		n.tray = nil
+		delete(b.notifications, id)
 	}
-	d := t.data(nifInfo) // an empty balloon hides the current one
-	procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&d)))
+	if !t.temporary {
+		d := t.data(nifInfo) // an empty balloon hides the current one
+		shellNotifyIcon(nimModify, &d)
+	}
 	t.destroyBalloonIcon()
+	b.showQueuedNotification()
 }
 
 // Global shortcuts.

@@ -76,6 +76,9 @@ type Backend struct {
 
 	watchingPower bool
 	notifications map[string]*notification
+	// notificationQueue holds the notifications waiting for the icon that
+	// shows them, in order.
+	notificationQueue []string
 
 	themeSource string
 	badge       string

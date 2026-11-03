@@ -117,7 +117,8 @@ type Backend interface {
 
 	NotificationsSupported() bool
 	// ShowNotification shows n; done runs on the main thread once the
-	// system has it, or with why it could not.
+	// platform has it, or with why it could not. A platform may show it
+	// later, in turn with others given; done reports that it took it.
 	ShowNotification(n *Notification, done func(error))
 	RemoveNotification(id string)
 	// RemoveAllNotifications removes the app's notifications, on macOS

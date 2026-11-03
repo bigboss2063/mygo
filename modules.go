@@ -965,17 +965,19 @@ func (n *Notification) ID() string { return n.id }
 // not allowed the app to show notifications (macOS).
 var ErrNotificationsDenied = platform.ErrNotificationsDenied
 
-// Show displays the notification, and returns once the system has it. On
-// macOS the first notification asks the user whether to allow them, and
-// Show waits for the answer; it returns ErrNotificationsDenied when they
-// are not allowed.
+// Show displays the notification, and returns once the platform has it. A
+// platform may show it later, in turn with others (Windows does); Show
+// returns when it takes it. On macOS the first notification asks the user
+// whether to allow them, and Show waits for the answer; it returns
+// ErrNotificationsDenied when they are not allowed.
 func (n *Notification) Show() error {
 	return n.ShowContext(context.Background())
 }
 
 // ShowContext is Show with a cancellable delivery wait. Cancellation stops
-// waiting for authorization and removes an undelivered notification. The
-// context governs delivery only; a successfully shown notification stays.
+// waiting for authorization and removes a notification the platform has
+// not taken. A notification the platform took stays, even if it shows it
+// later.
 func (n *Notification) ShowContext(ctx context.Context) error {
 	needsApp("Notification.Show")
 	if err := ctx.Err(); err != nil {
